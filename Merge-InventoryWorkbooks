@@ -12,7 +12,8 @@
 param(
     [string]$SourceFolder,
     [string]$OutputFile,
-    [switch]$NoDialog
+    [switch]$NoDialog,
+    [switch]$ShowWps
 )
 
 Set-StrictMode -Version Latest
@@ -65,6 +66,47 @@ function Select-OutputFile {
     $dialog.FileName = '盘点数据合并.xlsx'
     if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
     return $dialog.FileName
+}
+
+function New-ProgressWindow([int]$Maximum) {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = '盘点数据合并进度'
+    $form.Size = New-Object System.Drawing.Size(760, 180)
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.ControlBox = $false
+    $label = New-Object System.Windows.Forms.Label
+    $label.AutoSize = $true
+    $label.Location = New-Object System.Drawing.Point(22, 20)
+    $label.Text = '正在准备…'
+    $detail = New-Object System.Windows.Forms.Label
+    $detail.AutoEllipsis = $true
+    $detail.Size = New-Object System.Drawing.Size(700, 40)
+    $detail.Location = New-Object System.Drawing.Point(22, 48)
+    $progressBar = New-Object System.Windows.Forms.ProgressBar
+    $progressBar.Minimum = 0
+    $progressBar.Maximum = [Math]::Max(1, $Maximum)
+    $progressBar.Size = New-Object System.Drawing.Size(700, 24)
+    $progressBar.Location = New-Object System.Drawing.Point(22, 98)
+    [void]$form.Controls.AddRange(@($label, $detail, $progressBar))
+    $form.Show()
+    [System.Windows.Forms.Application]::DoEvents()
+    return [pscustomobject]@{ Form = $form; Label = $label; Detail = $detail; Bar = $progressBar }
+}
+
+function Update-ProgressWindow([object]$ProgressWindow, [int]$Current, [int]$Maximum, [string]$Stage, [string]$FilePath) {
+    if ($null -eq $ProgressWindow) { return }
+    $ProgressWindow.Bar.Maximum = [Math]::Max(1, $Maximum)
+    $ProgressWindow.Bar.Value = [Math]::Min([Math]::Max(0, $Current), $ProgressWindow.Bar.Maximum)
+    $ProgressWindow.Label.Text = "$Stage（$Current / $Maximum）"
+    $ProgressWindow.Detail.Text = $FilePath
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Write-RunLog([string]$LogFile, [string]$Message) {
+    Add-Content -LiteralPath $LogFile -Value ("[{0:yyyy-MM-dd HH:mm:ss}] {1}" -f (Get-Date), $Message) -Encoding UTF8
 }
 
 function Normalize-Text([object]$Value) {
@@ -419,6 +461,8 @@ if (-not $outputFile) { return }
 if (-not (Test-Path -LiteralPath $sourceFolder -PathType Container)) { throw "来源文件夹不存在：$sourceFolder" }
 $sourceFolder = (Resolve-Path -LiteralPath $sourceFolder).Path
 $outputFile = [System.IO.Path]::GetFullPath($outputFile)
+$logFile = Join-Path ([System.IO.Path]::GetDirectoryName($outputFile)) ('盘点数据合并日志_{0:yyyyMMdd_HHmmss}.txt' -f (Get-Date))
+Set-Content -LiteralPath $logFile -Value "盘点数据合并日志`r`n来源文件夹：$sourceFolder`r`n输出文件：$outputFile" -Encoding UTF8
 
 $extensions = @('.xlsx', '.xls', '.xlsm', '.xlsb')
 $files = Get-ChildItem -LiteralPath $sourceFolder -Recurse -File | Where-Object {
@@ -444,16 +488,25 @@ foreach ($type in $TargetSheets) {
 $warnings = New-Object System.Collections.ArrayList
 $uniqueFiles = New-Object System.Collections.ArrayList
 $seenContentHashes = @{}
+$progressWindow = New-ProgressWindow $files.Count
+$hashIndex = 0
 foreach ($file in $files) {
+    $hashIndex++
+    Update-ProgressWindow $progressWindow $hashIndex $files.Count '正在检查重复文件' $file.FullName
+    Write-RunLog $logFile "检查文件哈希：$($file.FullName)"
     try {
         $hash = Get-WorkbookContentHash $file.FullName
         if ($seenContentHashes.ContainsKey($hash)) {
-            [void]$warnings.Add("内容与已处理文件完全相同，已跳过重复副本：$($file.FullName)；保留：$($seenContentHashes[$hash])")
+            $warning = "内容与已处理文件完全相同，已跳过重复副本：$($file.FullName)；保留：$($seenContentHashes[$hash])"
+            [void]$warnings.Add($warning)
+            Write-RunLog $logFile $warning
             continue
         }
         $seenContentHashes[$hash] = $file.FullName
     } catch {
-        [void]$warnings.Add("无法计算文件内容哈希，将按单独来源读取：$($file.FullName)；$($_.Exception.Message)")
+        $warning = "无法计算文件内容哈希，将按单独来源读取：$($file.FullName)；$($_.Exception.Message)"
+        [void]$warnings.Add($warning)
+        Write-RunLog $logFile $warning
     }
     [void]$uniqueFiles.Add($file)
 }
@@ -464,11 +517,16 @@ $processedFiles = 0
 
 try {
     $application = New-SpreadsheetApplication
-    $application.Visible = $false
+    $application.Visible = [bool]$ShowWps
     $application.DisplayAlerts = $false
+    Write-RunLog $logFile "已完成哈希检查，待读取工作簿：$($files.Count) 个。"
+    $readIndex = 0
     foreach ($file in $files) {
+        $readIndex++
         $sourceWorkbook = $null
         try {
+            Update-ProgressWindow $progressWindow $readIndex $files.Count '正在读取工作簿' $file.FullName
+            Write-RunLog $logFile "开始读取（$readIndex/$($files.Count)）：$($file.FullName)"
             $sourceWorkbook = $application.Workbooks.Open($file.FullName, 0, $true)
             $processedFiles++
             for ($sheetIndex = 1; $sheetIndex -le $sourceWorkbook.Worksheets.Count; $sheetIndex++) {
@@ -478,13 +536,18 @@ try {
                     [void](Add-SheetRows $records[$type.Name] $worksheet $type $file.FullName $sourceFolder $warnings $seenAssetCodesByType[$type.Name] $deduplicationStats)
                 }
             }
+            Write-RunLog $logFile "读取完成（$readIndex/$($files.Count)）：$($file.FullName)"
         } catch {
-            [void]$warnings.Add("读取失败，已跳过：$($file.FullName)；$($_.Exception.Message)")
+            $warning = "读取失败，已跳过：$($file.FullName)；$($_.Exception.Message)"
+            [void]$warnings.Add($warning)
+            Write-RunLog $logFile $warning
         } finally {
             if ($null -ne $sourceWorkbook) { $sourceWorkbook.Close($false) }
         }
     }
 
+    Update-ProgressWindow $progressWindow $files.Count $files.Count '正在生成合并结果' $outputFile
+    Write-RunLog $logFile '开始生成合并结果工作簿。'
     $outputWorkbook = $application.Workbooks.Add()
     while ($outputWorkbook.Worksheets.Count -gt 1) { $outputWorkbook.Worksheets.Item($outputWorkbook.Worksheets.Count).Delete() }
     $firstSheet = $outputWorkbook.Worksheets.Item(1)
@@ -497,14 +560,16 @@ try {
         Write-OutputSheet $sheet $type $records[$type.Name]
     }
     $outputWorkbook.SaveAs($outputFile, 51)
-    $summary = "合并完成。`r`n已读取工作簿：$processedFiles 个`r`n行政盘点单：$($records['行政盘点单'].Count) 行（按资产编码跳过 $($deduplicationStats['行政盘点单']) 行）`r`n运营&高值盘点单：$($records['运营&高值盘点单'].Count) 行（按资产编码跳过 $($deduplicationStats['运营&高值盘点单']) 行）`r`n机房盘点单：$($records['机房盘点单'].Count) 行（按资产编码跳过 $($deduplicationStats['机房盘点单']) 行）`r`n保存位置：$outputFile"
-    if ($warnings.Count -gt 0) { $summary += "`r`n`r`n提示：有 $($warnings.Count) 项跳过或未识别。详细信息已输出到控制台。"; $warnings | ForEach-Object { Write-Warning $_ } }
+    Write-RunLog $logFile "合并结果已保存：$outputFile"
+    $summary = "合并完成。`r`n已读取工作簿：$processedFiles 个`r`n行政盘点单：$($records['行政盘点单'].Count) 行（按资产编码+设备名称跳过 $($deduplicationStats['行政盘点单']) 行）`r`n运营&高值盘点单：$($records['运营&高值盘点单'].Count) 行`r`n机房盘点单：$($records['机房盘点单'].Count) 行（按资产编码+设备名称跳过 $($deduplicationStats['机房盘点单']) 行）`r`n日志文件：$logFile`r`n保存位置：$outputFile"
+    if ($warnings.Count -gt 0) { $summary += "`r`n`r`n提示：有 $($warnings.Count) 项跳过或未识别，详见日志文件。"; $warnings | ForEach-Object { Write-Warning $_; Write-RunLog $logFile $_ } }
     if ($NoDialog) { Write-Output $summary }
     else {
         Add-Type -AssemblyName System.Windows.Forms
         [System.Windows.Forms.MessageBox]::Show($summary, '盘点数据合并') | Out-Null
     }
 } finally {
+    if ($null -ne $progressWindow -and -not $progressWindow.Form.IsDisposed) { $progressWindow.Form.Close() }
     if ($null -ne $outputWorkbook) { $outputWorkbook.Close($false) }
     if ($null -ne $application) { $application.Quit() }
     foreach ($comObject in @($outputWorkbook, $application)) {
@@ -513,6 +578,7 @@ try {
     [GC]::Collect()
     [GC]::WaitForPendingFinalizers()
 }
+
 
 
 
