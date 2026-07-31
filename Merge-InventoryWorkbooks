@@ -222,7 +222,7 @@ function Get-SourceInfo([string]$FilePath, [string]$SourceRoot, [object]$Values,
     $relativePath = $FilePath.Substring($SourceRoot.TrimEnd('\').Length).TrimStart('\')
     $area = Get-LabelValue $Values $RowCount $ColumnCount $HeaderAliases['营运区'] ($HeaderRow - 1)
     $branchFromSecondRow = Get-BranchFromSecondRow $Values $RowCount $ColumnCount
-    if (-not $area) { $area = Get-NameFromPath $relativePath '(?<value>[^\\/]*?(?:营运区|运营区))' $false }
+    if (-not $area) { $area = Get-NameFromPath $relativePath '(?<value>[^\\/]*?(?:市场管理区|营运区|运营区|管理区))' $false }
     if ($branchFromSecondRow) {
         return [pscustomobject]@{ 营运区 = $area; 分拨 = $branchFromSecondRow; BranchUsesArea = $false }
     }
@@ -263,6 +263,9 @@ function Split-AssetCodes([object]$Value) {
     $text = Normalize-Text $Value
     if (-not $text) { return @('') }
     $text = $text.Normalize([System.Text.NormalizationForm]::FormKC)
+    # Parenthesized text is a remark, not an asset code. Remove both full-width
+    # and half-width parenthesized segments before extracting numeric codes.
+    $text = $text -replace '[\(（][^\)）]*[\)）]', ''
     $compactText = $text -replace '\s+', ''
     # Some source cells concatenate several ten-digit codes without a separator.
     if ($compactText -match '^\d+$' -and $compactText.Length -gt 10 -and $compactText.Length % 10 -eq 0) {
@@ -429,6 +432,29 @@ function Get-WorkbookContentHash([string]$FilePath) {
     }
 }
 
+function Test-WorkbookContainer([string]$FilePath) {
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open($FilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $header = New-Object byte[] 4
+        if ($stream.Read($header, 0, 4) -ne 4) { return [pscustomobject]@{ IsValid = $false; Reason = '文件长度不足，无法识别工作簿格式。' } }
+        $extension = [System.IO.Path]::GetExtension($FilePath).ToLowerInvariant()
+        $isZip = $header[0] -eq 80 -and $header[1] -eq 75
+        $isOle = $header[0] -eq 208 -and $header[1] -eq 207 -and $header[2] -eq 17 -and $header[3] -eq 224
+        if (($extension -eq '.xlsx' -or $extension -eq '.xlsm') -and $isOle) {
+            return [pscustomobject]@{ IsValid = $true; Reason = "扩展名为 $extension，但实际是旧式 OLE 二进制工作簿；WPS 通常可正常处理，将继续尝试读取。" }
+        }
+        if (($extension -eq '.xlsx' -or $extension -eq '.xlsm') -and -not $isZip) {
+            return [pscustomobject]@{ IsValid = $true; Reason = "扩展名为 $extension，但文件头不是 OOXML ZIP 工作簿；将继续尝试读取。" }
+        }
+        return [pscustomobject]@{ IsValid = $true; Reason = '' }
+    } catch {
+        return [pscustomobject]@{ IsValid = $false; Reason = "无法读取文件头：$($_.Exception.Message)" }
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
 function Write-OutputSheet([object]$Sheet, [object]$Type, [object]$Records) {
     [string[]]$columns = @($Type.Columns)
     [int]$recordCount = [int]$Records.Count
@@ -463,6 +489,12 @@ $sourceFolder = (Resolve-Path -LiteralPath $sourceFolder).Path
 $outputFile = [System.IO.Path]::GetFullPath($outputFile)
 $logFile = Join-Path ([System.IO.Path]::GetDirectoryName($outputFile)) ('盘点数据合并日志_{0:yyyyMMdd_HHmmss}.txt' -f (Get-Date))
 Set-Content -LiteralPath $logFile -Value "盘点数据合并日志`r`n来源文件夹：$sourceFolder`r`n输出文件：$outputFile" -Encoding UTF8
+$skipListPath = Join-Path $PSScriptRoot '跳过合并文件名单.txt'
+$skipFileNames = @()
+if (Test-Path -LiteralPath $skipListPath) {
+    $skipFileNames = @(Get-Content -LiteralPath $skipListPath -Encoding UTF8 | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
+    Write-RunLog $logFile "已加载跳过名单：$skipListPath；条目数：$($skipFileNames.Count)"
+}
 
 $extensions = @('.xlsx', '.xls', '.xlsm', '.xlsb')
 $files = Get-ChildItem -LiteralPath $sourceFolder -Recurse -File | Where-Object {
@@ -494,6 +526,20 @@ foreach ($file in $files) {
     $hashIndex++
     Update-ProgressWindow $progressWindow $hashIndex $files.Count '正在检查重复文件' $file.FullName
     Write-RunLog $logFile "检查文件哈希：$($file.FullName)"
+    if ($skipFileNames -contains $file.Name) {
+        $warning = "位于跳过名单，已跳过：$($file.FullName)"
+        [void]$warnings.Add($warning)
+        Write-RunLog $logFile $warning
+        continue
+    }
+    $containerCheck = Test-WorkbookContainer $file.FullName
+    if (-not $containerCheck.IsValid) {
+        $warning = "文件格式异常，已跳过：$($file.FullName)；$($containerCheck.Reason)"
+        [void]$warnings.Add($warning)
+        Write-RunLog $logFile $warning
+        continue
+    }
+    if ($containerCheck.Reason) { Write-RunLog $logFile "格式提示：$($file.FullName)；$($containerCheck.Reason)" }
     try {
         $hash = Get-WorkbookContentHash $file.FullName
         if ($seenContentHashes.ContainsKey($hash)) {
@@ -578,19 +624,3 @@ try {
     [GC]::Collect()
     [GC]::WaitForPendingFinalizers()
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
