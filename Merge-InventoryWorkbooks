@@ -200,6 +200,9 @@ function Normalize-BranchName([object]$Value) {
     $branch = $branch -replace '分拨中心$', ''
     $branch = $branch -replace '分拨$', ''
     if (-not $branch) { return '' }
+    # The e-commerce branch is Guangzhou E-commerce Distribution Center even
+    # when source templates abbreviate it as just "电商分拨".
+    if ($branch -eq '电商') { return '广州电商分拨中心' }
     return $branch + '分拨中心'
 }
 
@@ -577,7 +580,25 @@ try {
             $processedFiles++
             for ($sheetIndex = 1; $sheetIndex -le $sourceWorkbook.Worksheets.Count; $sheetIndex++) {
                 $worksheet = $sourceWorkbook.Worksheets.Item($sheetIndex)
+                # WPS/Excel: -1 means visible, 0 hidden, and 2 very hidden.
+                # Hidden template or historical sheets must not enter the merge.
+                if ([int]$worksheet.Visible -ne -1) {
+                    Write-RunLog $logFile "工作表已隐藏，已跳过：$($file.FullName) -> $($worksheet.Name)"
+                    continue
+                }
                 $type = Get-MatchingSheetType ([string]$worksheet.Name)
+                if ($null -eq $type -and (Normalize-Text $worksheet.Name) -eq 'Sheet1') {
+                    # Some branch workbooks keep the completed operating-inventory
+                    # table on a visible default-named sheet. Identify it by its
+                    # material-property header instead of treating it as unrelated.
+                    $sheetUsedRange = $worksheet.UsedRange
+                    $sheetValues = $sheetUsedRange.Value2
+                    $sheetHeader = Find-HeaderRow $sheetValues ([int]$sheetUsedRange.Rows.Count) ([int]$sheetUsedRange.Columns.Count) $TargetSheets[1]
+                    if ($null -ne $sheetHeader -and $sheetHeader.Map.ContainsKey('物资属性')) {
+                        $type = $TargetSheets[1]
+                        Write-RunLog $logFile "按表头识别可见 Sheet1 为运营&高值盘点单：$($file.FullName) -> $($worksheet.Name)"
+                    }
+                }
                 if ($null -ne $type) {
                     [void](Add-SheetRows $records[$type.Name] $worksheet $type $file.FullName $sourceFolder $warnings $seenAssetCodesByType[$type.Name] $deduplicationStats)
                 }
