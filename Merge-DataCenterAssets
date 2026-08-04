@@ -1,0 +1,452 @@
+<#
+.SYNOPSIS
+    Merge visible data-center asset worksheets into one workbook.
+
+.DESCRIPTION
+    Reads only visible worksheet names that identify data-center/network/monitoring
+    inventory. Merged source cells are expanded into every output row, except
+    expected, actual, and difference quantities, which remain only on the first
+    split asset-code row.
+#>
+
+param(
+    [string]$SourceFolder,
+    [string]$OutputFile,
+    [switch]$NoDialog,
+    [switch]$ShowWps
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$OutputColumns = @('营运区', '分拨', '设备名称', '品牌', '型号', '应盘数量', '实盘数量', '差异数量', '存放地点', '备注', '资产编码', '设备状态')
+$HeaderAliases = @{
+    '营运区' = @('营运区', '运营区')
+    '分拨' = @('分拨', '分拨中心', '网点')
+    '设备名称' = @('设备名称', '物资名称', '名称')
+    '品牌' = @('品牌')
+    '型号' = @('型号', '规格型号', '规格')
+    '应盘数量' = @('应盘数量', '账面数量', '系统数量', '应盘')
+    '实盘数量' = @('实盘数量', '盘点数量', '实际数量', '实盘')
+    '差异数量' = @('差异数量', '差异')
+    '存放地点' = @('存放地点', '存放位置', '位置')
+    '备注' = @('备注', '说明')
+    '资产编码' = @('资产编码', '资产编号', '固定资产编码', '设备编码')
+    '设备状态' = @('设备状态', '状态')
+}
+
+function Select-SourceFolder {
+    Add-Type -AssemblyName System.Windows.Forms
+    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dialog.Description = '请选择包含机房资产盘点文件的来源文件夹'
+    $dialog.ShowNewFolderButton = $false
+    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+    return $dialog.SelectedPath
+}
+
+function Select-OutputFile {
+    Add-Type -AssemblyName System.Windows.Forms
+    $dialog = New-Object System.Windows.Forms.SaveFileDialog
+    $dialog.Title = '保存合并后的机房资产工作簿'
+    $dialog.Filter = 'Excel 工作簿 (*.xlsx)|*.xlsx'
+    $dialog.DefaultExt = 'xlsx'
+    $dialog.AddExtension = $true
+    $dialog.FileName = '机房资产数据合并.xlsx'
+    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+    return $dialog.FileName
+}
+
+function New-ProgressWindow([int]$Maximum) {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = '机房资产合并进度'
+    $form.Size = New-Object System.Drawing.Size(760, 180)
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.ControlBox = $false
+    $label = New-Object System.Windows.Forms.Label
+    $label.AutoSize = $true
+    $label.Location = New-Object System.Drawing.Point(22, 20)
+    $label.Text = '正在准备…'
+    $detail = New-Object System.Windows.Forms.Label
+    $detail.AutoEllipsis = $true
+    $detail.Size = New-Object System.Drawing.Size(700, 40)
+    $detail.Location = New-Object System.Drawing.Point(22, 48)
+    $progressBar = New-Object System.Windows.Forms.ProgressBar
+    $progressBar.Minimum = 0
+    $progressBar.Maximum = [Math]::Max(1, $Maximum)
+    $progressBar.Size = New-Object System.Drawing.Size(700, 24)
+    $progressBar.Location = New-Object System.Drawing.Point(22, 98)
+    [void]$form.Controls.AddRange(@($label, $detail, $progressBar))
+    $form.Show()
+    [System.Windows.Forms.Application]::DoEvents()
+    return [pscustomobject]@{ Form = $form; Label = $label; Detail = $detail; Bar = $progressBar }
+}
+
+function Update-ProgressWindow([object]$ProgressWindow, [int]$Current, [int]$Maximum, [string]$Stage, [string]$FilePath) {
+    if ($null -eq $ProgressWindow) { return }
+    $ProgressWindow.Bar.Maximum = [Math]::Max(1, $Maximum)
+    $ProgressWindow.Bar.Value = [Math]::Min([Math]::Max(0, $Current), $ProgressWindow.Bar.Maximum)
+    $ProgressWindow.Label.Text = "$Stage（$Current / $Maximum）"
+    $ProgressWindow.Detail.Text = $FilePath
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Write-RunLog([string]$LogFile, [string]$Message) {
+    Add-Content -LiteralPath $LogFile -Value ("[{0:yyyy-MM-dd HH:mm:ss}] {1}" -f (Get-Date), $Message) -Encoding UTF8
+}
+
+function Normalize-Text([object]$Value) {
+    if ($null -eq $Value) { return '' }
+    return ([string]$Value).Replace([char]0x3000, ' ').Replace("`r", '').Replace("`n", '').Trim()
+}
+
+function Normalize-Header([object]$Value) {
+    return (Normalize-Text $Value).Replace(' ', '').Replace('：', '').Replace(':', '')
+}
+
+function Get-MatrixValue([object]$Matrix, [int]$Row, [int]$Column) {
+    if ($null -eq $Matrix) { return $null }
+    if ($Matrix -is [System.Array] -and $Matrix.Rank -eq 2) {
+        if ($Row -lt $Matrix.GetLowerBound(0) -or $Row -gt $Matrix.GetUpperBound(0) -or $Column -lt $Matrix.GetLowerBound(1) -or $Column -gt $Matrix.GetUpperBound(1)) { return $null }
+        return $Matrix[$Row, $Column]
+    }
+    if ($Row -eq 1 -and $Column -eq 1) { return $Matrix }
+    return $null
+}
+
+function Test-DataCenterSheetName([string]$SheetName) {
+    $name = (Normalize-Text $SheetName).Replace(' ', '')
+    return $name.Contains('机房') -or $name.Contains('网络') -or $name.Contains('监控')
+}
+
+function Find-HeaderRow([object]$Values, [int]$RowCount, [int]$ColumnCount) {
+    $limit = [Math]::Min($RowCount, 40)
+    for ($row = 1; $row -le $limit; $row++) {
+        $found = @{}
+        for ($column = 1; $column -le $ColumnCount; $column++) {
+            $header = Normalize-Header (Get-MatrixValue $Values $row $column)
+            if (-not $header) { continue }
+            foreach ($field in $HeaderAliases.Keys) {
+                if (-not $found.ContainsKey($field) -and ($HeaderAliases[$field] | Where-Object { $alias = Normalize-Header $_; $header -eq $alias -or $header.StartsWith($alias) } | Select-Object -First 1)) {
+                    $found[$field] = $column
+                }
+            }
+        }
+        if ($found.ContainsKey('设备名称') -and ($found.ContainsKey('资产编码') -or $found.ContainsKey('应盘数量') -or $found.ContainsKey('实盘数量'))) {
+            return [pscustomobject]@{ Row = $row; Map = $found }
+        }
+    }
+    return $null
+}
+
+function Get-LabelValue([object]$Values, [int]$RowCount, [int]$ColumnCount, [string[]]$Labels, [int]$LastRow) {
+    $maxRows = [Math]::Min([Math]::Min($RowCount, 20), $LastRow)
+    $maxColumns = [Math]::Min($ColumnCount, 30)
+    for ($row = 1; $row -le $maxRows; $row++) {
+        for ($column = 1; $column -le $maxColumns; $column++) {
+            $text = Normalize-Header (Get-MatrixValue $Values $row $column)
+            foreach ($label in $Labels) {
+                if ($text -eq (Normalize-Header $label)) {
+                    foreach ($candidate in @((Get-MatrixValue $Values $row ($column + 1)), (Get-MatrixValue $Values ($row + 1) $column))) {
+                        $value = Normalize-Text $candidate
+                        if ($value -and $value -ne $text) { return $value }
+                    }
+                }
+            }
+        }
+    }
+    return ''
+}
+
+function Get-NameFromPath([string]$Path, [string]$Pattern, [bool]$UseLastMatch) {
+    $matches = [regex]::Matches($Path, $Pattern)
+    if ($matches.Count -eq 0) { return '' }
+    if ($UseLastMatch) { return $matches[$matches.Count - 1].Groups['value'].Value }
+    return $matches[0].Groups['value'].Value
+}
+
+function Normalize-BranchName([object]$Value) {
+    $branch = Normalize-Text $Value
+    if (-not $branch) { return '' }
+    $branch = $branch -replace '^所属分拨\s*[:：]?\s*', ''
+    $branch = $branch -replace '\s+', ''
+    $branch = $branch -replace '分拨中心$', ''
+    $branch = $branch -replace '分拨$', ''
+    if (-not $branch) { return '' }
+    if ($branch -eq '电商') { return '广州电商分拨中心' }
+    return $branch + '分拨中心'
+}
+
+function Get-BranchFromSecondRow([object]$Values, [int]$RowCount, [int]$ColumnCount) {
+    if ($RowCount -lt 2) { return '' }
+    for ($column = 1; $column -le [Math]::Min($ColumnCount, 50); $column++) {
+        $text = Normalize-Text (Get-MatrixValue $Values 2 $column)
+        if ($text -match '所属分拨\s*[:：]\s*(.+)$') { return Normalize-BranchName $Matches[1] }
+        if ((Normalize-Header $text) -eq (Normalize-Header '所属分拨')) {
+            $right = Normalize-Text (Get-MatrixValue $Values 2 ($column + 1))
+            if ($right) { return Normalize-BranchName $right }
+        }
+    }
+    return ''
+}
+
+function Get-SourceInfo([string]$FilePath, [string]$SourceRoot, [object]$Values, [int]$RowCount, [int]$ColumnCount, [int]$HeaderRow) {
+    $relativePath = $FilePath.Substring($SourceRoot.TrimEnd('\').Length).TrimStart('\')
+    $area = Get-LabelValue $Values $RowCount $ColumnCount $HeaderAliases['营运区'] ($HeaderRow - 1)
+    if (-not $area) { $area = Get-NameFromPath $relativePath '(?<value>[^\\/]*?(?:市场管理区|营运区|运营区|管理区))' $false }
+    $branch = Get-BranchFromSecondRow $Values $RowCount $ColumnCount
+    if (-not $branch) { $branch = Get-LabelValue $Values $RowCount $ColumnCount $HeaderAliases['分拨'] ($HeaderRow - 1) }
+    if (-not $branch) { $branch = Get-NameFromPath $relativePath '(?<value>[^\\/]*?(?:分拨中心|分拨))' $true }
+    return [pscustomobject]@{ 营运区 = $area; 分拨 = (Normalize-BranchName $branch) }
+}
+
+function Get-ColumnValue([object]$Values, [int]$Row, [hashtable]$HeaderMap, [string]$Field) {
+    if (-not $HeaderMap.ContainsKey($Field)) { return $null }
+    return Get-MatrixValue $Values $Row ([int]$HeaderMap[$Field])
+}
+
+function Get-ExpandedValue([object]$Worksheet, [object]$UsedRange, [object]$Values, [int]$RelativeRow, [hashtable]$HeaderMap, [string]$Field) {
+    $raw = Get-ColumnValue $Values $RelativeRow $HeaderMap $Field
+    if (Normalize-Text $raw) { return $raw }
+    if (-not $HeaderMap.ContainsKey($Field)) { return $raw }
+    $cell = $Worksheet.Cells.Item(([int]$UsedRange.Row + $RelativeRow - 1), ([int]$UsedRange.Column + [int]$HeaderMap[$Field] - 1))
+    if (-not [bool]$cell.MergeCells) { return $raw }
+    $area = $cell.MergeArea
+    if ([int]$area.Rows.Count -le 1) { return $raw }
+    return $area.Cells.Item(1, 1).Value2
+}
+
+function Normalize-AssetCode([object]$Value) {
+    $code = Normalize-Text $Value
+    if (-not $code) { return '' }
+    $code = $code.Normalize([System.Text.NormalizationForm]::FormKC).Replace(' ', '')
+    if ($code -match '^\d+\.0+$') { $code = $code -replace '\.0+$', '' }
+    elseif ($code -match '^\d+(?:\.\d+)?[Ee][+-]?\d+$') {
+        try { $code = [decimal]::Parse($code, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture).ToString('0', [System.Globalization.CultureInfo]::InvariantCulture) } catch { }
+    }
+    if ($code -match '^\d+$' -and $code.Length -lt 10) { return $code.PadLeft(10, '0') }
+    return $code
+}
+
+function Split-AssetCodes([object]$Value) {
+    $text = Normalize-Text $Value
+    if (-not $text) { return @('') }
+    $text = $text.Normalize([System.Text.NormalizationForm]::FormKC)
+    $text = $text -replace '[\(（][^\)）]*[\)）]', ''
+    $compact = $text -replace '\s+', ''
+    if ($compact -match '^\d+$' -and $compact.Length -gt 10 -and $compact.Length % 10 -eq 0) {
+        $codes = New-Object System.Collections.ArrayList
+        for ($offset = 0; $offset -lt $compact.Length; $offset += 10) { [void]$codes.Add((Normalize-AssetCode $compact.Substring($offset, 10))) }
+        return [string[]]$codes.ToArray()
+    }
+    if ($compact -match '^\d+(?:\.0+)?(?:[Ee][+-]?\d+)?$') { return @(Normalize-AssetCode $text) }
+    $codes = New-Object System.Collections.ArrayList
+    foreach ($match in [regex]::Matches($text, '\d+')) { [void]$codes.Add((Normalize-AssetCode $match.Value)) }
+    if ($codes.Count -gt 0) { return [string[]]$codes.ToArray() }
+    return @($text)
+}
+
+function Get-DeduplicationKey([object]$Code, [object]$Device) {
+    $normalizedCode = Normalize-AssetCode $Code
+    if (-not $normalizedCode -or $normalizedCode -notmatch '^\d+$') { return '' }
+    return $normalizedCode + [char]31 + (Normalize-Text $Device).Normalize([System.Text.NormalizationForm]::FormKC)
+}
+
+function Get-LastNonEmptyRow([object]$Values, [int]$RowCount, [int]$ColumnCount) {
+    for ($row = $RowCount; $row -ge 1; $row--) {
+        for ($column = 1; $column -le $ColumnCount; $column++) {
+            if (Normalize-Text (Get-MatrixValue $Values $row $column)) { return $row }
+        }
+    }
+    return 0
+}
+
+function Test-TotalRow([object]$Values, [int]$Row, [int]$ColumnCount) {
+    for ($column = 1; $column -le $ColumnCount; $column++) {
+        if ((Normalize-Text (Get-MatrixValue $Values $Row $column)).Contains('合计')) { return $true }
+    }
+    return $false
+}
+
+function Add-DataCenterRows([System.Collections.ArrayList]$Destination, [object]$Worksheet, [string]$FilePath, [string]$SourceRoot, [hashtable]$SeenKeys, [System.Collections.ArrayList]$Warnings, [ref]$Deduplicated) {
+    $usedRange = $Worksheet.UsedRange
+    $rowCount = [int]$usedRange.Rows.Count
+    $columnCount = [int]$usedRange.Columns.Count
+    $values = $usedRange.Value2
+    $header = Find-HeaderRow $values $rowCount $columnCount
+    if ($null -eq $header) { [void]$Warnings.Add("未识别机房表头，已跳过：$FilePath -> $($Worksheet.Name)"); return }
+    $sourceInfo = Get-SourceInfo $FilePath $SourceRoot $values $rowCount $columnCount $header.Row
+    $lastRow = Get-LastNonEmptyRow $values $rowCount $columnCount
+    $quantityFields = @('应盘数量', '实盘数量', '差异数量')
+    for ($row = $header.Row + 1; $row -le $lastRow; $row++) {
+        if ($row -eq $lastRow -and (Test-TotalRow $values $row $columnCount)) { continue }
+        $rawDevice = Get-ExpandedValue $Worksheet $usedRange $values $row $header.Map '设备名称'
+        $rawCode = Get-ExpandedValue $Worksheet $usedRange $values $row $header.Map '资产编码'
+        $rawExpected = Get-ColumnValue $values $row $header.Map '应盘数量'
+        $rawActual = Get-ColumnValue $values $row $header.Map '实盘数量'
+        if (-not (Normalize-Text $rawDevice) -and -not (Normalize-Text $rawCode) -and -not (Normalize-Text $rawExpected) -and -not (Normalize-Text $rawActual)) { continue }
+        $expanded = @{}
+        foreach ($field in @('设备名称', '品牌', '型号', '存放地点', '备注', '设备状态')) { $expanded[$field] = Get-ExpandedValue $Worksheet $usedRange $values $row $header.Map $field }
+        $codes = @(Split-AssetCodes $rawCode)
+        for ($index = 0; $index -lt $codes.Count; $index++) {
+            $key = Get-DeduplicationKey $codes[$index] $expanded['设备名称']
+            if ($key -and $SeenKeys.ContainsKey($key)) { $Deduplicated.Value++; continue }
+            if ($key) { $SeenKeys[$key] = "$FilePath -> $($Worksheet.Name) 第 $row 行" }
+            $record = [ordered]@{ '营运区' = $sourceInfo.营运区; '分拨' = $sourceInfo.分拨; '设备名称' = $expanded['设备名称']; '品牌' = $expanded['品牌']; '型号' = $expanded['型号']; '应盘数量' = $(if ($index -eq 0) { $rawExpected } else { $null }); '实盘数量' = $(if ($index -eq 0) { $rawActual } else { $null }); '差异数量' = $(if ($index -eq 0) { Get-ColumnValue $values $row $header.Map '差异数量' } else { $null }); '存放地点' = $expanded['存放地点']; '备注' = $expanded['备注']; '资产编码' = $codes[$index]; '设备状态' = $expanded['设备状态'] }
+            [void]$Destination.Add($record)
+        }
+    }
+}
+
+function New-SpreadsheetApplication {
+    try { return New-Object -ComObject 'ket.Application' } catch { }
+    try { return New-Object -ComObject 'Excel.Application' } catch { }
+    throw '未检测到可自动化的 WPS 表格或 Microsoft Excel。'
+}
+
+function Get-WorkbookContentHash([string]$FilePath) {
+    $stream = $null
+    $algorithm = $null
+    try {
+        $stream = [System.IO.File]::Open($FilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
+        return ([System.BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace('-', '')
+    } finally {
+        if ($algorithm) { $algorithm.Dispose() }
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
+function Test-WorkbookContainer([string]$FilePath) {
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open($FilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $header = New-Object byte[] 4
+        if ($stream.Read($header, 0, 4) -ne 4) { return [pscustomobject]@{ IsValid = $false; Reason = '文件长度不足，无法识别工作簿格式。' } }
+        $extension = [System.IO.Path]::GetExtension($FilePath).ToLowerInvariant()
+        $isZip = $header[0] -eq 80 -and $header[1] -eq 75
+        $isOle = $header[0] -eq 208 -and $header[1] -eq 207 -and $header[2] -eq 17 -and $header[3] -eq 224
+        if (($extension -eq '.xlsx' -or $extension -eq '.xlsm') -and $isOle) { return [pscustomobject]@{ IsValid = $true; Reason = "扩展名为 $extension，但实际是旧式 OLE 二进制工作簿；将继续尝试读取。" } }
+        if (($extension -eq '.xlsx' -or $extension -eq '.xlsm') -and -not $isZip) { return [pscustomobject]@{ IsValid = $true; Reason = "扩展名为 $extension，但文件头不是 OOXML ZIP 工作簿；将继续尝试读取。" } }
+        return [pscustomobject]@{ IsValid = $true; Reason = '' }
+    } catch {
+        return [pscustomobject]@{ IsValid = $false; Reason = "无法读取文件头：$($_.Exception.Message)" }
+    } finally {
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
+function Write-OutputSheet([object]$Sheet, [object[]]$Records) {
+    [int]$recordCount = $Records.Count
+    [int]$columnCount = $OutputColumns.Count
+    $matrix = [System.Array]::CreateInstance([object], [int[]]@(($recordCount + 1), $columnCount))
+    for ($c = 0; $c -lt $columnCount; $c++) { $matrix.SetValue($OutputColumns[$c], 0, $c) }
+    for ($r = 0; $r -lt $recordCount; $r++) { for ($c = 0; $c -lt $columnCount; $c++) { $matrix.SetValue($Records[$r][$OutputColumns[$c]], $r + 1, $c) } }
+    $range = $Sheet.Cells.Item(1, 1).Resize($recordCount + 1, $columnCount)
+    $Sheet.Columns.Item([Array]::IndexOf([string[]]$OutputColumns, '资产编码') + 1).NumberFormat = '@'
+    $range.Value2 = $matrix
+    $Sheet.Rows.Item(1).Font.Bold = $true
+    $Sheet.Rows.Item(1).HorizontalAlignment = -4108
+    $Sheet.UsedRange.EntireColumn.AutoFit() | Out-Null
+}
+
+$sourceFolder = if ($SourceFolder) { $SourceFolder } else { Select-SourceFolder }
+if (-not $sourceFolder) { return }
+$outputFile = if ($OutputFile) { $OutputFile } else { Select-OutputFile }
+if (-not $outputFile) { return }
+if (-not (Test-Path -LiteralPath $sourceFolder -PathType Container)) { throw "来源文件夹不存在：$sourceFolder" }
+$sourceFolder = (Resolve-Path -LiteralPath $sourceFolder).Path
+$outputFile = [System.IO.Path]::GetFullPath($outputFile)
+$logFile = Join-Path ([System.IO.Path]::GetDirectoryName($outputFile)) ('机房资产合并日志_{0:yyyyMMdd_HHmmss}.txt' -f (Get-Date))
+Set-Content -LiteralPath $logFile -Value "机房资产合并日志`r`n来源文件夹：$sourceFolder`r`n输出文件：$outputFile" -Encoding UTF8
+
+$files = @(Get-ChildItem -LiteralPath $sourceFolder -Recurse -File | Where-Object { $_.Name -notlike '~$*' -and $_.Extension.ToLowerInvariant() -in @('.xlsx', '.xls', '.xlsm', '.xlsb') -and $_.FullName -ne $outputFile })
+if ($files.Count -eq 0) {
+    $message = '所选文件夹及子文件夹中没有 Excel 工作簿。'
+    if ($NoDialog) { Write-Warning $message } else { Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show($message, '机房资产合并') | Out-Null }
+    return
+}
+$skipListPath = Join-Path $PSScriptRoot '跳过合并文件名单.txt'
+$skipFileNames = @()
+if (Test-Path -LiteralPath $skipListPath) {
+    $skipFileNames = @(Get-Content -LiteralPath $skipListPath -Encoding UTF8 | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
+    Write-RunLog $logFile "已加载跳过名单：$skipListPath；条目数：$($skipFileNames.Count)"
+}
+$records = New-Object System.Collections.ArrayList
+$seenKeys = @{}
+$warnings = New-Object System.Collections.ArrayList
+$deduplicated = 0
+$progressWindow = New-ProgressWindow $files.Count
+$uniqueFiles = New-Object System.Collections.ArrayList
+$seenContentHashes = @{}
+$hashIndex = 0
+foreach ($file in $files) {
+    $hashIndex++
+    Update-ProgressWindow $progressWindow $hashIndex $files.Count '正在检查重复文件' $file.FullName
+    Write-RunLog $logFile "检查文件：$($file.FullName)"
+    if ($skipFileNames -contains $file.Name) {
+        $warning = "位于跳过名单，已跳过：$($file.FullName)"
+        [void]$warnings.Add($warning); Write-RunLog $logFile $warning
+        continue
+    }
+    $containerCheck = Test-WorkbookContainer $file.FullName
+    if (-not $containerCheck.IsValid) {
+        $warning = "文件格式异常，已跳过：$($file.FullName)；$($containerCheck.Reason)"
+        [void]$warnings.Add($warning); Write-RunLog $logFile $warning
+        continue
+    }
+    if ($containerCheck.Reason) { Write-RunLog $logFile "格式提示：$($file.FullName)；$($containerCheck.Reason)" }
+    try {
+        $hash = Get-WorkbookContentHash $file.FullName
+        if ($seenContentHashes.ContainsKey($hash)) {
+            $warning = "内容与已处理文件完全相同，已跳过重复副本：$($file.FullName)；保留：$($seenContentHashes[$hash])"
+            [void]$warnings.Add($warning); Write-RunLog $logFile $warning
+            continue
+        }
+        $seenContentHashes[$hash] = $file.FullName
+    } catch {
+        $warning = "无法计算文件内容哈希，将按单独来源读取：$($file.FullName)；$($_.Exception.Message)"
+        [void]$warnings.Add($warning); Write-RunLog $logFile $warning
+    }
+    [void]$uniqueFiles.Add($file)
+}
+$files = $uniqueFiles
+$application = $null
+$outputWorkbook = $null
+try {
+    $application = New-SpreadsheetApplication
+    $application.Visible = [bool]$ShowWps
+    $application.DisplayAlerts = $false
+    $readIndex = 0
+    foreach ($file in $files) {
+        $readIndex++
+        $sourceWorkbook = $null
+        try {
+            Update-ProgressWindow $progressWindow $readIndex $files.Count '正在读取工作簿' $file.FullName
+            Write-RunLog $logFile "开始读取：$($file.FullName)"
+            $sourceWorkbook = $application.Workbooks.Open($file.FullName, 0, $true)
+            for ($sheetIndex = 1; $sheetIndex -le $sourceWorkbook.Worksheets.Count; $sheetIndex++) {
+                $worksheet = $sourceWorkbook.Worksheets.Item($sheetIndex)
+                if ([int]$worksheet.Visible -ne -1) { Write-RunLog $logFile "工作表已隐藏，已跳过：$($file.FullName) -> $($worksheet.Name)"; continue }
+                if (Test-DataCenterSheetName $worksheet.Name) { Add-DataCenterRows $records $worksheet $file.FullName $sourceFolder $seenKeys $warnings ([ref]$deduplicated) }
+            }
+        } catch { [void]$warnings.Add("读取失败，已跳过：$($file.FullName)；$($_.Exception.Message)"); Write-RunLog $logFile $warnings[$warnings.Count - 1] } finally { if ($sourceWorkbook) { $sourceWorkbook.Close($false) } }
+    }
+    Update-ProgressWindow $progressWindow $files.Count $files.Count '正在生成合并结果' $outputFile
+    $outputWorkbook = $application.Workbooks.Add()
+    while ($outputWorkbook.Worksheets.Count -gt 1) { $outputWorkbook.Worksheets.Item($outputWorkbook.Worksheets.Count).Delete() }
+    $sheet = $outputWorkbook.Worksheets.Item(1)
+    $sheet.Name = '机房盘点单'
+    Write-OutputSheet $sheet $records
+    $outputWorkbook.SaveAs($outputFile, 51)
+    $summary = "合并完成。`r`n机房资产：$($records.Count) 行`r`n按资产编码+设备名称跳过：$deduplicated 行`r`n日志文件：$logFile`r`n保存位置：$outputFile"
+    if ($warnings.Count -gt 0) { $summary += "`r`n提示：有 $($warnings.Count) 项跳过或未识别，详见日志。"; $warnings | ForEach-Object { Write-Warning $_; Write-RunLog $logFile $_ } }
+    if ($NoDialog) { Write-Output $summary } else { Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show($summary, '机房资产合并') | Out-Null }
+} finally {
+    if ($progressWindow -and -not $progressWindow.Form.IsDisposed) { $progressWindow.Form.Close() }
+    if ($outputWorkbook) { $outputWorkbook.Close($false) }
+    if ($application) { $application.Quit(); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($application) }
+    [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+}
