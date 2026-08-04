@@ -117,7 +117,18 @@ function Convert-ToFullWidth([string]$Text) {
 
 function Normalize-Branch([object]$Value) {
     $branch = (Normalize-Text $Value).Normalize([System.Text.NormalizationForm]::FormKC) -replace '\s+', ''
+    # 仅忽略末尾“中心”，绝不删除名称中的城市或业务前缀。
+    # 例如“广州电商分拨中心”标准化后仍是“广州电商分拨”，不会变成“电商分拨”。
     $branch = $branch -replace '中心$', ''
+    # 历史合并结果将“广州电商分拨中心”错误写成“电商分拨中心”。
+    # 当前没有独立的“电商分拨”，统一校正为系统中的正式名称。
+    if ($branch -eq '电商分拨') { $branch = '广州电商分拨' }
+    return $branch
+}
+
+function Get-CanonicalBranchName([object]$Value) {
+    $branch = Normalize-Text $Value
+    if ((Normalize-Branch $branch) -eq '广州电商分拨') { return '广州电商分拨中心' }
     return $branch
 }
 
@@ -165,27 +176,19 @@ function Convert-ToQuantity([object]$Value, [string]$SourceName, [string]$SheetN
 
 function Get-SmartWorksheetData([object]$Worksheet) {
     Write-Host "读取工作表[$($Worksheet.Name)]的范围信息。"
-    $used = $Worksheet.UsedRange
-    [int]$startRow = [int]$used.Row
-    [int]$startColumn = [int]$used.Column
-    [int]$columnCount = [Math]::Min([int]$used.Columns.Count, 100)
-    if ($columnCount -lt 1) { $columnCount = 1 }
-    # Some WPS files have a UsedRange extended to a million formatted blank
-    # rows. Read a bounded block and trim empty tail rows in memory.
-    [int]$scanRows = 1000
-    $range = $Worksheet.Range($Worksheet.Cells.Item($startRow, $startColumn), $Worksheet.Cells.Item($startRow + $scanRows - 1, $startColumn + $columnCount - 1))
-    Write-Host "读取工作表[$($Worksheet.Name)]前 $scanRows 行数据。"
+    # UsedRange may include a million format-only rows in WPS. Find searches
+    # values/formulas only, so it returns the real data boundary.
+    $anchor = $Worksheet.Cells.Item(1, 1)
+    $lastRowCell = $Worksheet.Cells.Find('*', $anchor, -4123, 2, 1, 2, $false, $false, $false)
+    $lastColumnCell = $Worksheet.Cells.Find('*', $anchor, -4123, 2, 2, 2, $false, $false, $false)
+    if ($null -eq $lastRowCell -or $null -eq $lastColumnCell) { throw "工作表[$($Worksheet.Name)]没有可读取的数据。" }
+    [int]$lastRow = [int]$lastRowCell.Row
+    [int]$lastColumn = [int]$lastColumnCell.Column
+    $range = $Worksheet.Range($Worksheet.Cells.Item(1, 1), $Worksheet.Cells.Item($lastRow, $lastColumn))
+    Write-Host "读取工作表[$($Worksheet.Name)]实际数据范围：$lastRow 行，$lastColumn 列。"
     $values = $range.Value2
-    Write-Host "工作表[$($Worksheet.Name)]数据读取完成，正在裁剪空行。"
-    [int]$lastNonEmptyRow = 1
-    for ($row = $scanRows; $row -ge 1; $row--) {
-        for ($column = 1; $column -le $columnCount; $column++) {
-            if (Normalize-Text (Get-MatrixValue $values $row $column)) { $lastNonEmptyRow = $row; break }
-        }
-        if ($lastNonEmptyRow -eq $row) { break }
-    }
-    if ($lastNonEmptyRow -eq $scanRows) { throw "工作表[$($Worksheet.Name)]前 $scanRows 行均可能有数据，当前脚本为避免异常整列格式仅读取前 $scanRows 行。请联系维护人员扩大读取上限。" }
-    return [pscustomobject]@{ Values = $values; Rows = $lastNonEmptyRow; Columns = $columnCount }
+    Write-Host "工作表[$($Worksheet.Name)]数据读取完成。"
+    return [pscustomobject]@{ Values = $values; Rows = $lastRow; Columns = $lastColumn }
 }
 
 function Read-Inventory([object]$Worksheet, [string]$SourceName, [bool]$RequireArea, [System.Collections.ArrayList]$Errors) {
@@ -205,8 +208,9 @@ function Read-Inventory([object]$Worksheet, [string]$SourceName, [bool]$RequireA
         $actualNumber = Convert-ToQuantity $actual $SourceName $Worksheet.Name $row '实盘数量' $Errors
         if ($null -eq $expectedNumber -or $null -eq $actualNumber) { continue }
         $area = if ($header.Map.ContainsKey('营运区')) { Get-MatrixValue $values $row $header.Map['营运区'] } else { '' }
-        $branch = Get-MatrixValue $values $row $header.Map['分拨']
-        $key = (Normalize-Area $area) + [char]31 + (Normalize-Branch $branch) + [char]31 + (Normalize-Device $device)
+        $branch = Get-CanonicalBranchName (Get-MatrixValue $values $row $header.Map['分拨'])
+        # 营运区仅供结果查看，不参与运营&高值的对比键。
+        $key = (Normalize-Branch $branch) + [char]31 + (Normalize-Device $device)
         [void]$records.Add([pscustomobject]@{ Key = $key; 营运区 = Normalize-Text $area; 分拨 = Normalize-Text $branch; 设备名称 = Normalize-Device $device; 应盘数量 = $expectedNumber; 实盘数量 = $actualNumber })
     }
     return $records
@@ -265,19 +269,15 @@ function Build-DifferenceRows([hashtable]$BranchGroups, [hashtable]$SystemGroups
         if ($SystemGroups.ContainsKey($key)) { foreach ($record in $SystemGroups[$key]) { [void]$system.Add($record) } }
         $reason = Get-DifferenceReason $branch $system
         if (-not $reason) { continue }
-        $sample = if ($branch.Count -gt 0) { $branch[0] } else { $system[0] }
-        if ($branch.Count -gt 5 -or $system.Count -gt 5) {
-            [void]$rows.Add([pscustomobject]@{ 营运区 = $sample.营运区; 分拨 = $sample.分拨; 设备名称 = $sample.设备名称; 分拨月盘数据应盘数量 = Get-Sum $branch '应盘数量'; 分拨月盘数据实盘数量 = Get-Sum $branch '实盘数量'; 系统数据应盘数量 = Get-Sum $system '应盘数量'; 系统数据实盘数量 = Get-Sum $system '实盘数量'; 差异说明 = $reason })
-            continue
-        }
-        $remaining = Get-UnmatchedRecords $branch $system
-        foreach ($record in $remaining.分拨) { [void]$rows.Add([pscustomobject]@{ 营运区 = $sample.营运区; 分拨 = $sample.分拨; 设备名称 = $sample.设备名称; 分拨月盘数据应盘数量 = $record.应盘数量; 分拨月盘数据实盘数量 = $record.实盘数量; 系统数据应盘数量 = $null; 系统数据实盘数量 = $null; 差异说明 = $reason }) }
-        foreach ($record in $remaining.系统) { [void]$rows.Add([pscustomobject]@{ 营运区 = $sample.营运区; 分拨 = $sample.分拨; 设备名称 = $sample.设备名称; 分拨月盘数据应盘数量 = $null; 分拨月盘数据实盘数量 = $null; 系统数据应盘数量 = $record.应盘数量; 系统数据实盘数量 = $record.实盘数量; 差异说明 = $reason }) }
+        # 同一分拨名称跨营运区时仍需对比；结果营运区以系统数据为准。
+        $sample = if ($system.Count -gt 0) { $system[0] } else { $branch[0] }
+        # 差异表按标准化后的分拨和设备汇总：两侧数量必须出现在同一行，便于直接判断差异。
+        [void]$rows.Add([pscustomobject]@{ 营运区 = $sample.营运区; 分拨 = $sample.分拨; 设备名称 = $sample.设备名称; 分拨月盘数据应盘数量 = Get-Sum $branch '应盘数量'; 分拨月盘数据实盘数量 = Get-Sum $branch '实盘数量'; 系统数据应盘数量 = Get-Sum $system '应盘数量'; 系统数据实盘数量 = Get-Sum $system '实盘数量'; 差异说明 = $reason })
     }
     return $rows
 }
 
-function Find-MachineHeader([object]$Values, [int]$Rows, [int]$Columns, [string]$SheetName) {
+function Find-MachineHeader([object]$Values, [int]$Rows, [int]$Columns, [string]$SheetName, [bool]$IsSystem) {
     for ($row = 1; $row -le [Math]::Min($Rows, 40); $row++) {
         $map = @{}
         $assetCodeColumn = 0; $deviceCodeColumn = 0
@@ -287,18 +287,20 @@ function Find-MachineHeader([object]$Values, [int]$Rows, [int]$Columns, [string]
                 if (-not $map.ContainsKey($field) -and ($ColumnAliases[$field] | Where-Object { $header -eq (Normalize-Header $_) } | Select-Object -First 1)) { $map[$field] = $column }
             }
             if (-not $map.ContainsKey('分拨') -and ($header -eq '位置20' -or $header -eq '位置')) { $map['分拨'] = $column }
+            if (-not $map.ContainsKey('系统数量') -and $header -eq '数量') { $map['系统数量'] = $column }
             if ($header -notmatch '财务') {
                 if ($header -match '资产编码') { $assetCodeColumn = $column }
                 elseif ($header -match '设备编码') { $deviceCodeColumn = $column }
             }
             if (-not $map.ContainsKey('设备名称') -and ($header -match '设备名称|资产名称')) { $map['设备名称'] = $column }
         }
-        $missing = @(@('分拨', '设备名称') | Where-Object { -not $map.ContainsKey($_) })
+        $required = if ($IsSystem) { @('分拨', '设备名称', '系统数量') } else { @('分拨', '设备名称', '实盘数量') }
+        $missing = @($required | Where-Object { -not $map.ContainsKey($_) })
         if ($missing.Count -gt 0) { continue }
         $map['设备编码'] = if ($assetCodeColumn -gt 0) { $assetCodeColumn } else { $deviceCodeColumn }
         if ($map['设备编码'] -gt 0) { return [pscustomobject]@{ Row = $row; Map = $map } }
     }
-    throw "工作表[$SheetName]缺少必要列：营运区、分拨、设备名称或资产名称、资产编码或设备编码。"
+    throw "工作表[$SheetName]缺少必要列：$($required -join '、')、资产编码或设备编码。"
 }
 
 function Normalize-MachineCode([object]$Value) {
@@ -310,26 +312,35 @@ function Normalize-MachineCode([object]$Value) {
     return ''
 }
 
-function Normalize-HardDiskName([object]$Value) { return ((Normalize-Text $Value).Normalize([System.Text.NormalizationForm]::FormKC) -replace '\s+', '') }
+function Normalize-HardDiskName([object]$Value) {
+    $name = ((Normalize-Text $Value).Normalize([System.Text.NormalizationForm]::FormKC) -replace '\s+', '')
+    # 系统表常以“监控-硬盘3T”等用途前缀命名，月盘常只写“硬盘3T”。
+    # 硬盘数量核对以硬盘型号/容量为准，因此从“硬盘”开始取值。
+    $diskIndex = $name.IndexOf('硬盘')
+    if ($diskIndex -ge 0) { return $name.Substring($diskIndex) }
+    return $name
+}
 
-function Read-MachineInventory([object]$Worksheet, [string]$SourceName, [System.Collections.ArrayList]$Errors) {
+function Read-MachineInventory([object]$Worksheet, [string]$SourceName, [bool]$IsSystem, [System.Collections.ArrayList]$Errors) {
     $data = Get-SmartWorksheetData $Worksheet
     Write-Host "工作表[$($Worksheet.Name)]正在识别机房表头。"
     $rows = [int]$data.Rows; $columns = [int]$data.Columns; $values = $data.Values
-    $header = Find-MachineHeader $values $rows $columns $Worksheet.Name
+    $header = Find-MachineHeader $values $rows $columns $Worksheet.Name $IsSystem
     Write-Host "工作表[$($Worksheet.Name)]表头识别完成，开始解析 $rows 行数据。"
     $records = New-Object System.Collections.ArrayList
     for ($row = $header.Row + 1; $row -le $rows; $row++) {
         $device = Get-MatrixValue $values $row $header.Map['设备名称']
         $rawCode = Get-MatrixValue $values $row $header.Map['设备编码']
         if (-not (Normalize-Text $device) -and -not (Normalize-Text $rawCode)) { continue }
-        $area = Get-MatrixValue $values $row $header.Map['营运区']; $branch = Get-MatrixValue $values $row $header.Map['分拨']
+        $area = Get-MatrixValue $values $row $header.Map['营运区']; $branch = Get-CanonicalBranchName (Get-MatrixValue $values $row $header.Map['分拨'])
         $code = Normalize-MachineCode $rawCode
         if ((Normalize-Text $rawCode) -and -not $code) { [void]$Errors.Add([pscustomobject]@{ 来源 = $SourceName; 工作表 = $Worksheet.Name; 行号 = $row; 列名 = '设备编码'; 原始值 = $rawCode }) }
         $expected = if ($header.Map.ContainsKey('应盘数量')) { Convert-ToQuantity (Get-MatrixValue $values $row $header.Map['应盘数量']) $SourceName $Worksheet.Name $row '应盘数量' $Errors } else { [decimal]0 }
         $actual = if ($header.Map.ContainsKey('实盘数量')) { Convert-ToQuantity (Get-MatrixValue $values $row $header.Map['实盘数量']) $SourceName $Worksheet.Name $row '实盘数量' $Errors } else { [decimal]0 }
+        $systemQuantity = if ($header.Map.ContainsKey('系统数量')) { Convert-ToQuantity (Get-MatrixValue $values $row $header.Map['系统数量']) $SourceName $Worksheet.Name $row '数量' $Errors } else { [decimal]0 }
         if ($null -eq $expected) { $expected = [decimal]0 }; if ($null -eq $actual) { $actual = [decimal]0 }
-        [void]$records.Add([pscustomobject]@{ BranchKey = Normalize-Branch $branch; 营运区名称 = Normalize-Text $area; 分拨名称 = Normalize-Text $branch; 设备名称 = Normalize-Text $device; 设备编码 = $code; 应盘数量 = $expected; 实盘数量 = $actual; 是硬盘 = (Normalize-Text $device).Contains('硬盘') })
+        if ($null -eq $systemQuantity) { $systemQuantity = [decimal]0 }
+        [void]$records.Add([pscustomobject]@{ BranchKey = Normalize-Branch $branch; 营运区名称 = Normalize-Text $area; 分拨名称 = Normalize-Text $branch; 设备名称 = Normalize-Text $device; 设备编码 = $code; 应盘数量 = $expected; 实盘数量 = $actual; 系统数量 = $systemQuantity; 是硬盘 = (Normalize-Text $device).Contains('硬盘') })
     }
     Write-Host "工作表[$($Worksheet.Name)]机房记录解析完成：$($records.Count) 条。"
     return $records
@@ -361,11 +372,11 @@ function Build-MachineDifferenceRows([System.Collections.ArrayList]$BranchRecord
                 $left = New-Object System.Collections.ArrayList; $right = New-Object System.Collections.ArrayList
                 if ($branchHardDisks.ContainsKey($key)) { foreach ($record in $branchHardDisks[$key]) { [void]$left.Add($record) } }
                 if ($systemHardDisks.ContainsKey($key)) { foreach ($record in $systemHardDisks[$key]) { [void]$right.Add($record) } }
-                $leftExpected = [decimal]0; $leftActual = [decimal]0; $rightExpected = [decimal]0; $rightActual = [decimal]0
-                foreach ($record in $left) { $leftExpected += $record.应盘数量; $leftActual += $record.实盘数量 }; foreach ($record in $right) { $rightExpected += $record.应盘数量; $rightActual += $record.实盘数量 }
-                if ($leftExpected -eq $rightExpected -and $leftActual -eq $rightActual) { continue }
+                $leftActual = [decimal]0; $rightQuantity = [decimal]0
+                foreach ($record in $left) { $leftActual += $record.实盘数量 }; foreach ($record in $right) { $rightQuantity += $record.系统数量 }
+                if ($leftActual -eq $rightQuantity) { continue }
                 $sample = if ($left.Count -gt 0) { $left[0] } else { $right[0] }
-                $reason = "硬盘数量对比：分拨月盘应盘$leftExpected、实盘$leftActual；系统应盘$rightExpected、实盘$rightActual"
+                $reason = "硬盘数量对比：分拨月盘实盘$leftActual；系统数量$rightQuantity"
                 [void]$rows.Add([pscustomobject]@{ 营运区名称 = $sample.营运区名称; 分拨名称 = $sample.分拨名称; 设备名称 = $sample.设备名称; 设备编码 = ''; 差异原因 = $reason })
             }
         }
@@ -421,19 +432,19 @@ try {
     if (-not $branchSheet) { throw "分拨月盘数据表中未找到[$target]工作表。" }
     if ($target -eq '运营&高值盘点单') {
         Write-Host '正在读取运营&高值数据。'
-        $systemRecords = Read-Inventory $systemSheet '系统数据' $true $errors
-        $branchRecords = Read-Inventory $branchSheet '分拨月盘数据' $true $errors
+        $systemRecords = @(Read-Inventory $systemSheet '系统数据' $true $errors)
+        $branchRecords = @(Read-Inventory $branchSheet '分拨月盘数据' $true $errors)
         $branchNames = @{}; foreach ($record in $branchRecords) { $branchNames[(Normalize-Branch $record.分拨)] = $true }
         $filteredSystemRecords = New-Object System.Collections.ArrayList
         foreach ($record in $systemRecords) { if ($branchNames.ContainsKey((Normalize-Branch $record.分拨))) { [void]$filteredSystemRecords.Add($record) } }
         $systemRecords = $filteredSystemRecords
-        $differenceRows = Build-DifferenceRows (Group-Records $branchRecords) (Group-Records $systemRecords)
+        $differenceRows = @(Build-DifferenceRows (Group-Records $branchRecords) (Group-Records $systemRecords))
         [string[]]$diffColumns = @('营运区', '分拨', '设备名称', '分拨月盘数据应盘数量', '分拨月盘数据实盘数量', '系统数据应盘数量', '系统数据实盘数量', '差异说明')
     } else {
         Write-Host '正在读取机房编码数据。'
-        $systemRecords = Read-MachineInventory $systemSheet '系统数据' $errors
+        $systemRecords = @(Read-MachineInventory $systemSheet '系统数据' $true $errors)
         Write-Host "系统机房记录读取完成：$($systemRecords.Count) 条。"
-        $branchRecords = Read-MachineInventory $branchSheet '分拨月盘数据' $errors
+        $branchRecords = @(Read-MachineInventory $branchSheet '分拨月盘数据' $false $errors)
         Write-Host "分拨机房记录读取完成：$($branchRecords.Count) 条。"
         $branchNames = @{}; $areaByBranch = @{}
         foreach ($record in $branchRecords) {
@@ -448,7 +459,7 @@ try {
             }
         }
         $systemRecords = $filteredSystemRecords
-        $differenceRows = Build-MachineDifferenceRows $branchRecords $systemRecords
+        $differenceRows = @(Build-MachineDifferenceRows $branchRecords $systemRecords)
         Write-Host "机房差异计算完成：$($differenceRows.Count) 行。"
         [string[]]$diffColumns = @('营运区名称', '分拨名称', '设备名称', '设备编码', '差异原因')
     }
