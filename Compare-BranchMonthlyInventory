@@ -385,6 +385,66 @@ function Build-MachineDifferenceRows([System.Collections.ArrayList]$BranchRecord
     return $rows
 }
 
+function Find-AdministrativeHeader([object]$Values, [int]$Rows, [int]$Columns, [string]$SheetName) {
+    for ($row = 1; $row -le [Math]::Min($Rows, 40); $row++) {
+        $map = @{}
+        $assetCodeColumn = 0; $deviceCodeColumn = 0
+        for ($column = 1; $column -le $Columns; $column++) {
+            $header = Normalize-Header (Get-MatrixValue $Values $row $column)
+            foreach ($field in $ColumnAliases.Keys) {
+                if (-not $map.ContainsKey($field) -and ($ColumnAliases[$field] | Where-Object { $header -eq (Normalize-Header $_) } | Select-Object -First 1)) { $map[$field] = $column }
+            }
+            if (-not $map.ContainsKey('分拨') -and ($header -eq '位置20' -or $header -eq '位置')) { $map['分拨'] = $column }
+            if ($header -notmatch '财务') {
+                if ($header -match '资产编码') { $assetCodeColumn = $column }
+                elseif ($header -match '设备编码') { $deviceCodeColumn = $column }
+            }
+            if (-not $map.ContainsKey('设备名称') -and ($header -match '设备名称|资产名称')) { $map['设备名称'] = $column }
+        }
+        $required = @('分拨', '设备名称')
+        $missing = @($required | Where-Object { -not $map.ContainsKey($_) })
+        if ($missing.Count -gt 0) { continue }
+        $map['资产编码'] = if ($assetCodeColumn -gt 0) { $assetCodeColumn } else { $deviceCodeColumn }
+        if ($map['资产编码'] -gt 0) { return [pscustomobject]@{ Row = $row; Map = $map } }
+    }
+    throw "工作表[$SheetName]缺少必要列：分拨、设备名称、资产编码或设备编码。"
+}
+
+function Read-AdministrativeInventory([object]$Worksheet, [string]$SourceName, [System.Collections.ArrayList]$Errors) {
+    $data = Get-SmartWorksheetData $Worksheet
+    Write-Host "工作表[$($Worksheet.Name)]正在识别行政资产表头。"
+    $rows = [int]$data.Rows; $columns = [int]$data.Columns; $values = $data.Values
+    $header = Find-AdministrativeHeader $values $rows $columns $Worksheet.Name
+    $records = New-Object System.Collections.ArrayList
+    for ($row = $header.Row + 1; $row -le $rows; $row++) {
+        $device = Get-MatrixValue $values $row $header.Map['设备名称']
+        $rawCode = Get-MatrixValue $values $row $header.Map['资产编码']
+        if (-not (Normalize-Text $device) -and -not (Normalize-Text $rawCode)) { continue }
+        $branch = Get-CanonicalBranchName (Get-MatrixValue $values $row $header.Map['分拨'])
+        $area = if ($header.Map.ContainsKey('营运区')) { Get-MatrixValue $values $row $header.Map['营运区'] } else { '' }
+        $code = Normalize-MachineCode $rawCode
+        if ((Normalize-Text $rawCode) -and -not $code) { [void]$Errors.Add([pscustomobject]@{ 来源 = $SourceName; 工作表 = $Worksheet.Name; 行号 = $row; 列名 = '资产编码'; 原始值 = $rawCode }); continue }
+        if (-not $code) { continue }
+        [void]$records.Add([pscustomobject]@{ BranchKey = Normalize-Branch $branch; 营运区名称 = Normalize-Text $area; 分拨名称 = Normalize-Text $branch; 设备名称 = Normalize-Text $device; 资产编码 = $code })
+    }
+    Write-Host "工作表[$($Worksheet.Name)]行政资产记录解析完成：$($records.Count) 条。"
+    return $records
+}
+
+function Build-AdministrativeDifferenceRows([System.Collections.ArrayList]$BranchRecords, [System.Collections.ArrayList]$SystemRecords) {
+    $rows = New-Object System.Collections.ArrayList
+    $branchGroups = @{}; $systemGroups = @{}
+    foreach ($record in $BranchRecords) { if (-not $branchGroups.ContainsKey($record.BranchKey)) { $branchGroups[$record.BranchKey] = @{} }; if (-not $branchGroups[$record.BranchKey].ContainsKey($record.资产编码)) { $branchGroups[$record.BranchKey][$record.资产编码] = $record } }
+    foreach ($record in $SystemRecords) { if (-not $systemGroups.ContainsKey($record.BranchKey)) { $systemGroups[$record.BranchKey] = @{} }; if (-not $systemGroups[$record.BranchKey].ContainsKey($record.资产编码)) { $systemGroups[$record.BranchKey][$record.资产编码] = $record } }
+    foreach ($branchKey in @($branchGroups.Keys + $systemGroups.Keys | Sort-Object -Unique)) {
+        $branchCodes = if ($branchGroups.ContainsKey($branchKey)) { $branchGroups[$branchKey] } else { @{} }
+        $systemCodes = if ($systemGroups.ContainsKey($branchKey)) { $systemGroups[$branchKey] } else { @{} }
+        foreach ($code in $branchCodes.Keys) { if (-not $systemCodes.ContainsKey($code)) { $record = $branchCodes[$code]; [void]$rows.Add([pscustomobject]@{ 营运区名称 = $record.营运区名称; 分拨名称 = $record.分拨名称; 设备名称 = $record.设备名称; 资产编码 = $code; 差异原因 = '分拨有、系统无' }) } }
+        foreach ($code in $systemCodes.Keys) { if (-not $branchCodes.ContainsKey($code)) { $record = $systemCodes[$code]; [void]$rows.Add([pscustomobject]@{ 营运区名称 = $record.营运区名称; 分拨名称 = $record.分拨名称; 设备名称 = $record.设备名称; 资产编码 = $code; 差异原因 = '系统有、分拨无' }) } }
+    }
+    return $rows
+}
+
 function New-SpreadsheetApplication { try { return New-Object -ComObject 'ket.Application' } catch { } ; try { return New-Object -ComObject 'Excel.Application' } catch { } ; throw '未检测到可自动化的 WPS 表格或 Microsoft Excel。' }
 
 function Write-Sheet([object]$Sheet, [string[]]$Columns, [object]$Rows) {
@@ -398,6 +458,7 @@ function Write-Sheet([object]$Sheet, [string[]]$Columns, [object]$Rows) {
     for ($row = 0; $row -lt $dataRowCount; $row++) { for ($column = 0; $column -lt $columnCount; $column++) { $matrix.SetValue($rowList[$row].($Columns[$column]), $row + 1, $column) } }
     $range = $Sheet.Cells.Item(1, 1).Resize($totalRowCount, $columnCount)
     $codeColumn = [Array]::IndexOf([string[]]$Columns, '设备编码') + 1
+    if ($codeColumn -eq 0) { $codeColumn = [Array]::IndexOf([string[]]$Columns, '资产编码') + 1 }
     if ($codeColumn -gt 0) { $Sheet.Columns.Item($codeColumn).NumberFormat = '@' }
     $range.Value2 = $matrix
     $Sheet.Rows.Item(1).Font.Bold = $true
@@ -407,7 +468,6 @@ function Write-Sheet([object]$Sheet, [string[]]$Columns, [object]$Rows) {
 
 $target = if ($Target) { $Target } else { Show-TargetSelector }
 if (-not $target) { Write-Host '已取消：未选择对比对象。'; return }
-if ($target -eq '行政盘点单') { throw "[$target]对比尚未启用；当前支持运营&高值盘点单和机房盘点单。" }
 Write-Host "已选择对比对象：$target"
 $systemFile = if ($SystemFile) { $SystemFile } else { Select-Workbook "第一步：请选择系统数据表（$target）" }
 if (-not $systemFile) { Write-Host '已取消：未选择系统数据表。'; return }
@@ -440,7 +500,7 @@ try {
         $systemRecords = $filteredSystemRecords
         $differenceRows = @(Build-DifferenceRows (Group-Records $branchRecords) (Group-Records $systemRecords))
         [string[]]$diffColumns = @('营运区', '分拨', '设备名称', '分拨月盘数据应盘数量', '分拨月盘数据实盘数量', '系统数据应盘数量', '系统数据实盘数量', '差异说明')
-    } else {
+    } elseif ($target -eq '机房盘点单') {
         Write-Host '正在读取机房编码数据。'
         $systemRecords = @(Read-MachineInventory $systemSheet '系统数据' $true $errors)
         Write-Host "系统机房记录读取完成：$($systemRecords.Count) 条。"
@@ -462,6 +522,28 @@ try {
         $differenceRows = @(Build-MachineDifferenceRows $branchRecords $systemRecords)
         Write-Host "机房差异计算完成：$($differenceRows.Count) 行。"
         [string[]]$diffColumns = @('营运区名称', '分拨名称', '设备名称', '设备编码', '差异原因')
+    } else {
+        Write-Host '正在读取行政资产编码数据。'
+        $systemRecords = @(Read-AdministrativeInventory $systemSheet '系统数据' $errors)
+        $branchRecords = @(Read-AdministrativeInventory $branchSheet '分拨月盘数据' $errors)
+        Write-Host "系统行政资产记录读取完成：$($systemRecords.Count) 条。"
+        Write-Host "分拨行政资产记录读取完成：$($branchRecords.Count) 条。"
+        $branchNames = @{}; $areaByBranch = @{}
+        foreach ($record in $branchRecords) {
+            $branchNames[$record.BranchKey] = $true
+            if (-not $areaByBranch.ContainsKey($record.BranchKey) -and $record.营运区名称) { $areaByBranch[$record.BranchKey] = $record.营运区名称 }
+        }
+        $filteredSystemRecords = New-Object System.Collections.ArrayList
+        foreach ($record in $systemRecords) {
+            if ($branchNames.ContainsKey($record.BranchKey)) {
+                if (-not $record.营运区名称 -and $areaByBranch.ContainsKey($record.BranchKey)) { $record.营运区名称 = $areaByBranch[$record.BranchKey] }
+                [void]$filteredSystemRecords.Add($record)
+            }
+        }
+        $systemRecords = $filteredSystemRecords
+        $differenceRows = @(Build-AdministrativeDifferenceRows $branchRecords $systemRecords)
+        Write-Host "行政资产差异计算完成：$($differenceRows.Count) 行。"
+        [string[]]$diffColumns = @('营运区名称', '分拨名称', '设备名称', '资产编码', '差异原因')
     }
     $outputWorkbook = $application.Workbooks.Add(); while ($outputWorkbook.Worksheets.Count -gt 1) { $outputWorkbook.Worksheets.Item($outputWorkbook.Worksheets.Count).Delete() }
     Write-Host '正在生成差异对比表。'
@@ -481,7 +563,8 @@ try {
     }
     exit 1
 } finally {
-    if ($outputWorkbook) { $outputWorkbook.Close($false) }; if ($systemWorkbook) { $systemWorkbook.Close($false) }; if ($branchWorkbook) { $branchWorkbook.Close($false) }; if ($application) { $application.Quit() }
-    foreach ($object in @($outputWorkbook, $systemWorkbook, $branchWorkbook, $application)) { if ($object) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($object) } }
+    foreach ($workbook in @($outputWorkbook, $systemWorkbook, $branchWorkbook)) { if ($workbook) { try { $workbook.Close($false) } catch { } } }
+    if ($application) { try { $application.Quit() } catch { } }
+    foreach ($object in @($outputWorkbook, $systemWorkbook, $branchWorkbook, $application)) { if ($object) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($object) } catch { } } }
     [GC]::Collect(); [GC]::WaitForPendingFinalizers()
 }
